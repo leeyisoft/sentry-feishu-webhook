@@ -14,7 +14,8 @@ load_dotenv()
 app = FastAPI(title="Sentry to Feishu Webhook Service", version="1.0.0")
 
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
-DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"  # 临时开启调试模式
+# 临时开启调试模式
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 
 if DEBUG_MODE:
     logger.add("debug.log", rotation="10 MB", level="DEBUG")
@@ -24,59 +25,264 @@ else:
 
 class FeishuMessage:
     @staticmethod
-    def build_message(issue_data: Dict[str, Any]) -> Dict[str, Any]:
-        # 从 Sentry webhook 数据中提取信息
-        title = issue_data.get("title") or issue_data.get("message", "Unknown Issue")
-        url = issue_data.get("url", "")
-        
-        # project 可能是字符串或对象
-        project = issue_data.get("project")
-        if isinstance(project, dict):
-            project_name = project.get("name", "Unknown Project")
-        elif isinstance(project, str):
-            project_name = project
-        else:
-            project_name = issue_data.get("project_name", "Unknown Project")
-        
-        # 尝试从多个位置获取环境信息
-        environment = "Unknown"
-        
-        # 处理 tags 字段 - 可能是字典或列表
-        if "tags" in issue_data:
-            tags = issue_data["tags"]
+    def _extract_nested_value(data: Dict[str, Any], *paths: str) -> Any:
+        """从嵌套字典中提取值，支持多个可能的路径"""
+        for path in paths:
+            keys = path.split('.')
+            value = data
+            try:
+                for key in keys:
+                    # 处理数组索引，如 frames.0 或 frames.-1
+                    if key.isdigit() and isinstance(value, list):
+                        index = int(key)
+                        if 0 <= index < len(value):
+                            value = value[index]
+                        else:
+                            value = None
+                            break
+                    elif key.startswith('-') and key[1:].isdigit() and isinstance(value, list):
+                        index = int(key)
+                        if abs(index) <= len(value):
+                            value = value[index]
+                        else:
+                            value = None
+                            break
+                    elif isinstance(value, dict) and key in value:
+                        value = value[key]
+                    elif isinstance(value, list) and len(value) > 0:
+                        # 如果是列表，尝试获取第一个元素
+                        value = value[0]
+                        if isinstance(value, dict) and key in value:
+                            value = value[key]
+                        else:
+                            value = None
+                            break
+                    else:
+                        value = None
+                        break
+                if value is not None:
+                    return value
+            except (TypeError, AttributeError, IndexError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_culprit_with_line(issue_data: Dict[str, Any]) -> str:
+        """提取包含文件名和行号的位置信息"""
+        # 1. 首先尝试从 culprit 字段获取（Sentry 已经格式化的位置）
+        culprit = FeishuMessage._extract_nested_value(issue_data, 'culprit')
+
+        # 2. 尝试从异常堆栈中提取行号信息
+        line_no = None
+        try:
+            # 获取异常堆栈帧 - 支持多种可能的路径
+            frames = FeishuMessage._extract_nested_value(
+                issue_data,
+                'exception.values.0.stacktrace.frames',
+                'stacktrace.frames',
+                'entries.0.data.values.0.stacktrace.frames',
+                'data.error.exception.values.0.stacktrace.frames'
+            )
+
+            if frames and isinstance(frames, list):
+                # 查找 in_app 为 true 的帧（应用代码）
+                target_frame = None
+                for frame in reversed(frames):
+                    if isinstance(frame, dict) and frame.get('in_app', False):
+                        target_frame = frame
+                        break
+
+                # 如果没有找到 in_app 的帧，使用最后一个帧
+                if target_frame is None and frames:
+                    target_frame = frames[-1]
+
+                if target_frame and isinstance(target_frame, dict):
+                    line_no = target_frame.get('lineno')
+
+                    # 如果已经有 culprit 并且找到了行号，检查是否需要添加行号信息
+                    if culprit and line_no:
+                        # 检查 culprit 是否已经包含行号信息
+                        has_line_info = any([
+                            f"line {line_no}" in culprit,
+                            f":{line_no}" in culprit,
+                            f" at {line_no}" in culprit,
+                            f"#{line_no}" in culprit
+                        ])
+
+                        if not has_line_info:
+                            return f"{culprit} at line {line_no}"
+        except (TypeError, AttributeError, IndexError, ValueError) as e:
+            logger.debug(f"Error extracting line number: {e}")
+            pass
+
+        # 3. 如果已经有 culprit 但没有行号，直接返回
+        if culprit and culprit != "Unknown":
+            return culprit
+
+        # 4. 尝试从堆栈帧中构建完整的位置信息
+        try:
+            if frames and isinstance(frames, list):
+                target_frame = None
+                for frame in reversed(frames):
+                    if isinstance(frame, dict) and frame.get('in_app', False):
+                        target_frame = frame
+                        break
+
+                if target_frame is None and frames:
+                    target_frame = frames[-1]
+
+                if target_frame and isinstance(target_frame, dict):
+                    filename = target_frame.get('filename', 'Unknown file')
+                    line_no = target_frame.get('lineno')
+                    function = target_frame.get('function', 'Unknown function')
+
+                    if filename and line_no:
+                        return f"{filename} in {function} at line {line_no}"
+                    elif filename:
+                        return f"{filename} in {function}"
+        except (TypeError, AttributeError, IndexError):
+            pass
+
+        # 5. 尝试从 metadata 中提取
+        filename = FeishuMessage._extract_nested_value(
+            issue_data,
+            'metadata.filename',
+            'metadata.abs_path'
+        )
+
+        if filename:
+            line_no = FeishuMessage._extract_nested_value(
+                issue_data,
+                'metadata.lineno',
+                'metadata.line'
+            )
+
+            function = FeishuMessage._extract_nested_value(
+                issue_data,
+                'metadata.function',
+                'metadata.module'
+            ) or 'Unknown function'
+
+            if filename and line_no:
+                return f"{filename} in {function} at line {line_no}"
+            elif filename:
+                return f"{filename} in {function}"
+
+        # 6. 最后尝试从 location 字段获取
+        location = FeishuMessage._extract_nested_value(issue_data, 'location')
+        if location and location != "Unknown":
+            return location
+
+        return "Unknown location"
+
+    @staticmethod
+    def _extract_environment(issue_data: Dict[str, Any]) -> str:
+        """从多个可能的位置提取环境信息"""
+        # 1. 直接从环境字段获取
+        environment = FeishuMessage._extract_nested_value(issue_data, 'environment')
+        if environment and environment != "Unknown":
+            return environment
+
+        # 2. 从 tags 中提取
+        tags = FeishuMessage._extract_nested_value(issue_data, 'tags')
+        if tags:
             if isinstance(tags, dict):
-                environment = tags.get("environment", "Unknown")
+                environment = tags.get('environment', 'Unknown')
             elif isinstance(tags, list):
                 for tag in tags:
-                    if isinstance(tag, dict) and tag.get("key") == "environment":
-                        environment = tag.get("value", "Unknown")
-                        break
-        
-        # 如果还没找到，尝试从 event.tags 中获取
-        if environment == "Unknown" and "event" in issue_data:
-            event = issue_data["event"]
-            if isinstance(event, dict) and "tags" in event:
-                event_tags = event["tags"]
-                if isinstance(event_tags, list):
-                    for tag in event_tags:
-                        if isinstance(tag, dict) and tag.get("key") == "environment":
-                            environment = tag.get("value", "Unknown")
-                            break
-                elif isinstance(event_tags, dict):
-                    environment = event_tags.get("environment", "Unknown")
-        
-        level = issue_data.get("level", "error")
-        culprit = issue_data.get("culprit", "Unknown")
-        message = issue_data.get("message", "No message provided")
-        
+                    if isinstance(tag, dict):
+                        if tag.get('key') == 'environment':
+                            return tag.get('value', 'Unknown')
+                        elif 'environment' in tag:
+                            return tag.get('environment', 'Unknown')
+                    elif isinstance(tag, list) and len(tag) == 2 and tag[0] == 'environment':
+                        return tag[1]
+
+        # 3. 从 _dsc 中提取
+        environment = FeishuMessage._extract_nested_value(issue_data, '_dsc.environment')
+        if environment and environment != "Unknown":
+            return environment
+
+        return "Unknown"
+
+    @staticmethod
+    def _extract_project_name(issue_data: Dict[str, Any]) -> str:
+        """提取项目名称"""
+        # 从错误数据中提取项目信息
+        project = FeishuMessage._extract_nested_value(issue_data, 'project')
+        if isinstance(project, dict):
+            return project.get('name', project.get('slug', 'Unknown Project'))
+        elif isinstance(project, str):
+            return project
+        elif isinstance(project, int):
+            # 如果是数字ID，可以尝试映射或返回默认值
+            return f"Project-{project}"
+        else:
+            return "Unknown Project"
+
+    @staticmethod
+    def build_message(issue_data: Dict[str, Any]) -> Dict[str, Any]:
+        # 调试：记录完整的数据结构
+        logger.debug(f"Raw issue data keys: {list(issue_data.keys())}")
+
+        # 从 Sentry webhook 数据中提取信息
+        # 标题可以从多个位置获取
+        title = FeishuMessage._extract_nested_value(
+            issue_data,
+            'title',
+            'metadata.value',
+            'metadata.type',
+            'exception.values.0.type',
+            'exception.values.0.value'
+        ) or "Unknown Issue"
+
+        # URL 可以从多个位置获取
+        url = FeishuMessage._extract_nested_value(
+            issue_data,
+            'url',
+            'web_url',
+            'issue_url'
+        ) or ""
+
+        # 提取项目名称
+        project_name = FeishuMessage._extract_project_name(issue_data)
+
+        # 提取环境信息
+        environment = FeishuMessage._extract_environment(issue_data)
+
+        # 提取级别
+        level = FeishuMessage._extract_nested_value(
+            issue_data,
+            'level',
+            'metadata.level',
+            'tags.level'
+        ) or "error"
+
+        # 提取包含行号的位置信息
+        culprit = FeishuMessage._extract_culprit_with_line(issue_data)
+
+        # 提取消息详情
+        message = FeishuMessage._extract_nested_value(
+            issue_data,
+            'message',
+            'metadata.value',
+            'exception.values.0.value',
+            'title'
+        ) or "No message provided"
+
+        # 如果消息太长，截断
+        if isinstance(message, str) and len(message) > 300:
+            message = message[:297] + "..."
+
         level_emoji = {
             "fatal": "🔴",
             "error": "🟠",
             "warning": "🟡",
             "info": "🔵",
             "debug": "⚪"
-        }.get(level, "⚫")
-        
+        }.get(level.lower(), "⚫")
+
+        # 构建消息内容
         msg_content = {
             "msg_type": "interactive",
             "card": {
@@ -88,7 +294,7 @@ class FeishuMessage:
                         "content": f"{level_emoji} Sentry Issue Alert",
                         "tag": "plain_text"
                     },
-                    "template": "red" if level in ["fatal", "error"] else "orange" if level == "warning" else "blue"
+                    "template": "red" if level.lower() in ["fatal", "error"] else "orange" if level.lower() == "warning" else "blue"
                 },
                 "elements": [
                     {
@@ -101,101 +307,113 @@ class FeishuMessage:
                     {
                         "tag": "div",
                         "text": {
-                            "content": f"**标题**: [{title}]({url})\n**位置**: {culprit}",
+                            "content": f"**标题**: {title}\n**位置**: {culprit}",
                             "tag": "lark_md"
                         }
                     },
                     {
                         "tag": "div",
                         "text": {
-                            "content": f"**详情**: {message[:200]}{'...' if len(message) > 200 else ''}",
+                            "content": f"**详情**: {message}",
                             "tag": "lark_md"
                         }
                     },
                     {
                         "tag": "hr"
-                    },
-                    {
-                        "tag": "div",
-                        "text": {
-                            "content": "<at id=all></at> 请相关同学及时处理",
-                            "tag": "lark_md"
-                        }
-                    },
-                    {
-                        "tag": "action",
-                        "actions": [
-                            {
-                                "tag": "button",
-                                "text": {
-                                    "tag": "plain_text",
-                                    "content": "查看详情"
-                                },
-                                "type": "primary",
-                                "url": url
-                            }
-                        ]
-                    },
-                    {
-                        "tag": "note",
-                        "elements": [
-                            {
-                                "tag": "plain_text",
-                                "content": f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                            }
-                        ]
                     }
+                    # 注释@所有人
+                    # , {
+                    #     "tag": "div",
+                    #     "text": {
+                    #         "content": "<at id=all></at> 请相关同学及时处理",
+                    #         "tag": "lark_md"
+                    #     }
+                    # }
                 ]
             }
         }
-        
+
+        # 只有在有有效 URL 时才添加查看详情按钮
+        if url and url.startswith(('http://', 'https://')):
+            msg_content["card"]["elements"].extend([
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {
+                                "tag": "plain_text",
+                                "content": "查看详情"
+                            },
+                            "type": "primary",
+                            "url": url
+                        }
+                    ]
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        }
+                    ]
+                }
+            ])
+        else:
+            msg_content["card"]["elements"].append({
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    }
+                ]
+            })
+
         return msg_content
 
 
 class WebhookHandler:
     def __init__(self):
-        # 禁用代理，避免SOCKS代理问题
         self.client = httpx.AsyncClient(
             timeout=30.0,
-            proxies=None  # 显式禁用代理
+            proxies=None
         )
-    
+
     async def send_to_feishu(self, issue_data: Dict[str, Any]) -> bool:
         try:
-            # 检查飞书 Webhook URL 是否配置
             if not FEISHU_WEBHOOK_URL or not FEISHU_WEBHOOK_URL.startswith(('http://', 'https://')):
                 logger.error(f"Invalid FEISHU_WEBHOOK_URL: '{FEISHU_WEBHOOK_URL}'")
-                logger.error("Please set FEISHU_WEBHOOK_URL environment variable with your Feishu webhook URL")
-                logger.error("Example: export FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx'")
                 return False
-            
-            # 先构建消息，捕获可能的错误
+
             try:
                 message = FeishuMessage.build_message(issue_data)
+                if DEBUG_MODE:
+                    logger.debug(f"Built message: {json.dumps(message, indent=2, ensure_ascii=False)[:500]}...")
             except Exception as e:
                 logger.error(f"Failed to build message: {str(e)}")
-                logger.error(f"Issue data: {json.dumps(issue_data, indent=2)[:1000]}")
+                logger.error(f"Issue data keys: {list(issue_data.keys())}")
                 return False
-            
-            logger.info(f"Sending to Feishu webhook: {FEISHU_WEBHOOK_URL[:50]}...")
+
             response = await self.client.post(
                 FEISHU_WEBHOOK_URL,
                 json=message,
                 headers={"Content-Type": "application/json"}
             )
-            
+
             if response.status_code == 200:
                 result = response.json()
                 if result.get("code") == 0:
-                    logger.info(f"Successfully sent message to Feishu")
+                    logger.info("Successfully sent message to Feishu")
                     return True
                 else:
                     logger.error(f"Feishu API error: {result}")
                     return False
             else:
-                logger.error(f"HTTP error: {response.status_code}")
+                logger.error(f"HTTP error: {response.status_code}, response: {response.text}")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Failed to send to Feishu: {str(e)}")
             import traceback
@@ -237,33 +455,51 @@ async def health():
 async def receive_sentry_webhook(request: Request):
     try:
         body = await request.body()
-        
-        
         data = json.loads(body)
-        
-        # 记录接收到的完整数据结构
-        logger.info(f"Received webhook data structure: {json.dumps(data, indent=2)[:500]}...")
-        
-        # Sentry webhook 直接发送 issue 数据
-        # 判断是否为有效的 issue 数据
-        if "id" in data and ("message" in data or "title" in data):
-            # 这是一个有效的 issue 数据
+
+        logger.info(f"Received webhook with keys: {list(data.keys())}")
+
+        if DEBUG_MODE:
+            logger.debug(f"Webhook action: {data.get('action')}")
+
+        issue_data = None
+        action = "unknown"
+
+        if "data" in data:
+            # 处理 Sentry webhook 格式 - 数据可能在 data.error 中
+            if "error" in data["data"]:
+                issue_data = data["data"]["error"]  # 错误数据在 data.error 中
+                logger.info("Found error data in data.error")
+            else:
+                issue_data = data["data"]  # 或者直接在 data 中
+                logger.info("Found data directly in data")
+
+            action = data.get("action", "unknown")
+            logger.info(f"Processing {action} action for issue")
+
+            if action != "created":
+                logger.info(f"Ignoring non-created action: {action}")
+                return {"status": "ignored", "message": f"Action {action} ignored"}
+
+        elif "id" in data and ("message" in data or "title" in data):
             issue_data = data
-            logger.info(f"Processing issue: {issue_data.get('id')} - {issue_data.get('message', '')}")
+            action = "direct"
+            logger.info("Processing direct issue data")
         else:
             logger.error(f"Invalid webhook data. Keys: {list(data.keys())}")
             raise HTTPException(status_code=400, detail="Invalid webhook data format")
-        
+
         success = await webhook_handler.send_to_feishu(issue_data)
-        
+
         if success:
             return {
                 "status": "success",
-                "message": "Notification sent to Feishu"
+                "message": "Notification sent to Feishu",
+                "action": action
             }
         else:
             raise HTTPException(status_code=500, detail="Failed to send to Feishu")
-            
+
     except json.JSONDecodeError:
         logger.error("Invalid JSON in request body")
         raise HTTPException(status_code=400, detail="Invalid JSON")
@@ -290,7 +526,6 @@ async def test_feishu_notification():
         return {"status": "success", "message": "Test notification sent"}
     else:
         raise HTTPException(status_code=500, detail="Failed to send test notification")
-
 
 if __name__ == "__main__":
     import uvicorn
