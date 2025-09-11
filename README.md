@@ -77,16 +77,53 @@ After=network.target
 
 [Service]
 Type=simple
+User=root
+WorkingDirectory=/usr/local/sentry-feishu-webhook
+EnvironmentFile=/usr/local/sentry-feishu-webhook/.env
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/usr/local/sentry-feishu-webhook/app.log
+StandardError=append:/usr/local/sentry-feishu-webhook/app.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+# 重新加载 systemd 配置
+sudo systemctl daemon-reload
+
+# 重启服务
+sudo systemctl restart sentry-feishu
+
+# 查看服务状态
+sudo systemctl status sentry-feishu
+
+# 查看实时日志
+sudo journalctl -u sentry-feishu -f
+```
+
+vent
+
+```ini
+[Unit]
+Description=Sentry to Feishu Webhook Service
+After=network.target
+
+[Service]
+Type=simple
 User=www-data
-WorkingDirectory=/opt/notify
-Environment="PATH=/opt/notify/venv/bin"
-ExecStart=/opt/notify/venv/bin/python main.py
+WorkingDirectory=/usr/local/sentry-feishu-webhook
+Environment="PATH=/usr/local/sentry-feishu-webhook/venv/bin"
+ExecStart=/usr/local/sentry-feishu-webhook/venv/bin/python main.py
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
+
 
 启动服务：
 

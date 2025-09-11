@@ -17,6 +17,62 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
 # 临时开启调试模式
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 
+# 解析忽略的项目ID配置
+def parse_ignore_project_ids() -> List[Any]:
+    """解析忽略的项目ID配置，支持数字和字符串"""
+    ignore_config = os.getenv("IGNORE_TO_FEECHU_PROJECT_IDS", "[]")
+    try:
+        # 移除可能的空格并解析JSON
+        ignore_config = ignore_config.strip()
+        if ignore_config.startswith('[') and ignore_config.endswith(']'):
+            return json.loads(ignore_config)
+        else:
+            # 如果不是JSON格式，尝试按逗号分割
+            items = [item.strip().strip('"').strip("'") for item in ignore_config.split(',')]
+            result = []
+            for item in items:
+                if item.isdigit():
+                    result.append(int(item))
+                else:
+                    result.append(item)
+            return result
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"Failed to parse IGNORE_TO_FEECHU_PROJECT_IDS: {e}, using empty list")
+        return []
+
+IGNORE_PROJECT_IDS = parse_ignore_project_ids()
+
+
+def should_ignore_project(issue_data: Dict[str, Any]) -> bool:
+    """检查项目是否应该被忽略"""
+    if not IGNORE_PROJECT_IDS:
+        return False
+    
+    # 提取项目信息
+    project = FeishuMessage._extract_nested_value(issue_data, 'project')
+    
+    if project is None:
+        return False
+    
+    # 如果project是字典，提取ID和名称
+    if isinstance(project, dict):
+        project_id = project.get('id')
+        project_name = project.get('name', project.get('slug', ''))
+        
+        # 检查项目ID或名称是否在忽略列表中
+        for ignore_item in IGNORE_PROJECT_IDS:
+            if project_id == ignore_item or project_name == ignore_item:
+                return True
+    
+    # 如果project是数字或字符串，直接比较
+    elif isinstance(project, (int, str)):
+        for ignore_item in IGNORE_PROJECT_IDS:
+            if project == ignore_item:
+                return True
+    
+    return False
+
+
 if DEBUG_MODE:
     logger.add("debug.log", rotation="10 MB", level="DEBUG")
 else:
@@ -69,11 +125,14 @@ class FeishuMessage:
     @staticmethod
     def _extract_culprit_with_line(issue_data: Dict[str, Any]) -> str:
         """提取包含文件名和行号的位置信息"""
-        # 1. 首先尝试从 culprit 字段获取（Sentry 已经格式化的位置）
+        # 1. 提取基础信息
         culprit = FeishuMessage._extract_nested_value(issue_data, 'culprit')
+        location = FeishuMessage._extract_nested_value(issue_data, 'location')
 
         # 2. 尝试从异常堆栈中提取行号信息
         line_no = None
+        frames = None
+
         try:
             # 获取异常堆栈帧 - 支持多种可能的路径
             frames = FeishuMessage._extract_nested_value(
@@ -98,26 +157,29 @@ class FeishuMessage:
 
                 if target_frame and isinstance(target_frame, dict):
                     line_no = target_frame.get('lineno')
-
-                    # 如果已经有 culprit 并且找到了行号，检查是否需要添加行号信息
-                    if culprit and line_no:
-                        # 检查 culprit 是否已经包含行号信息
-                        has_line_info = any([
-                            f"line {line_no}" in culprit,
-                            f":{line_no}" in culprit,
-                            f" at {line_no}" in culprit,
-                            f"#{line_no}" in culprit
-                        ])
-
-                        if not has_line_info:
-                            return f"{culprit} at line {line_no}"
         except (TypeError, AttributeError, IndexError, ValueError) as e:
             logger.debug(f"Error extracting line number: {e}")
             pass
 
-        # 3. 如果已经有 culprit 但没有行号，直接返回
-        if culprit and culprit != "Unknown":
-            return culprit
+        # 3. 如果有 location 信息，优先整合 location
+        if location and location != "Unknown":
+            # 如果 location 已经包含行号信息，直接返回
+            if line_no and str(line_no) in location:
+                return location
+
+            # 如果 location 是有效的文件路径，添加行号信息
+            if location and any(char in location for char in ['/', '\\', '.']):
+                if line_no:
+                    return f"{location} at line {line_no}"
+                else:
+                    return location
+
+            # 如果 location 不是文件路径，但与 culprit 不同，可以组合显示
+            if culprit and culprit != location:
+                if line_no:
+                    return f"{culprit} ({location}) at line {line_no}"
+                else:
+                    return f"{culprit} ({location})"
 
         # 4. 尝试从堆栈帧中构建完整的位置信息
         try:
@@ -136,10 +198,11 @@ class FeishuMessage:
                     line_no = target_frame.get('lineno')
                     function = target_frame.get('function', 'Unknown function')
 
-                    if filename and line_no:
-                        return f"{filename} in {function} at line {line_no}"
-                    elif filename:
-                        return f"{filename} in {function}"
+                    if filename and filename != "Unknown file":
+                        if line_no:
+                            return f"{filename} in {function} at line {line_no}"
+                        else:
+                            return f"{filename} in {function}"
         except (TypeError, AttributeError, IndexError):
             pass
 
@@ -151,11 +214,11 @@ class FeishuMessage:
         )
 
         if filename:
-            line_no = FeishuMessage._extract_nested_value(
+            line_no_meta = FeishuMessage._extract_nested_value(
                 issue_data,
                 'metadata.lineno',
                 'metadata.line'
-            )
+            ) or line_no  # 使用之前提取的行号作为备选
 
             function = FeishuMessage._extract_nested_value(
                 issue_data,
@@ -163,15 +226,35 @@ class FeishuMessage:
                 'metadata.module'
             ) or 'Unknown function'
 
-            if filename and line_no:
-                return f"{filename} in {function} at line {line_no}"
+            if filename and line_no_meta:
+                return f"{filename} in {function} at line {line_no_meta}"
             elif filename:
                 return f"{filename} in {function}"
 
-        # 6. 最后尝试从 location 字段获取
-        location = FeishuMessage._extract_nested_value(issue_data, 'location')
+        # 6. 如果有 culprit 信息
+        if culprit and culprit != "Unknown" and culprit != "root /":
+            if line_no:
+                # 检查 culprit 是否已经包含行号
+                has_line_info = any([
+                    f"line {line_no}" in culprit,
+                    f":{line_no}" in culprit,
+                    f" at {line_no}" in culprit,
+                    f"#{line_no}" in culprit
+                ])
+
+                if not has_line_info:
+                    return f"{culprit} at line {line_no}"
+            return culprit
+
+        # 7. 最后回退到 location 或默认值
         if location and location != "Unknown":
+            if line_no:
+                return f"{location} at line {line_no}"
             return location
+
+        # 8. 最终回退
+        if line_no:
+            return f"Unknown location at line {line_no}"
 
         return "Unknown location"
 
@@ -239,9 +322,9 @@ class FeishuMessage:
         # URL 可以从多个位置获取
         url = FeishuMessage._extract_nested_value(
             issue_data,
-            'url',
             'web_url',
-            'issue_url'
+            'issue_url',
+            'url'
         ) or ""
 
         # 提取项目名称
@@ -312,13 +395,6 @@ class FeishuMessage:
                         }
                     },
                     {
-                        "tag": "div",
-                        "text": {
-                            "content": f"**详情**: {message}",
-                            "tag": "lark_md"
-                        }
-                    },
-                    {
                         "tag": "hr"
                     }
                     # 注释@所有人
@@ -332,6 +408,16 @@ class FeishuMessage:
                 ]
             }
         }
+
+        # 只有在 message 不为空时才添加详情部分
+        if message and message != "" and message != "No message provided":
+            msg_content["card"]["elements"].append({
+                "tag": "div",
+                "text": {
+                    "content": f"**详情**: {message}",
+                    "tag": "lark_md"
+                }
+            })
 
         # 只有在有有效 URL 时才添加查看详情按钮
         if url and url.startswith(('http://', 'https://')):
@@ -390,7 +476,7 @@ class WebhookHandler:
             try:
                 message = FeishuMessage.build_message(issue_data)
                 if DEBUG_MODE:
-                    logger.debug(f"Built message: {json.dumps(message, indent=2, ensure_ascii=False)[:500]}...")
+                    logger.debug(f"Built message: {json.dumps(message, indent=2, ensure_ascii=False)}")
             except Exception as e:
                 logger.error(f"Failed to build message: {str(e)}")
                 logger.error(f"Issue data keys: {list(issue_data.keys())}")
@@ -429,6 +515,11 @@ async def startup_event():
     logger.info("Sentry-Feishu webhook service started")
     if not FEISHU_WEBHOOK_URL:
         logger.warning("FEISHU_WEBHOOK_URL not configured")
+    
+    if IGNORE_PROJECT_IDS:
+        logger.info(f"Configured to ignore projects: {IGNORE_PROJECT_IDS}")
+    else:
+        logger.info("No projects configured to be ignored")
 
 
 @app.on_event("shutdown")
@@ -455,6 +546,8 @@ async def health():
 async def receive_sentry_webhook(request: Request):
     try:
         body = await request.body()
+        if DEBUG_MODE:
+            logger.debug(f"receive_sentry_webhook body: {body}")
         data = json.loads(body)
 
         logger.info(f"Received webhook with keys: {list(data.keys())}")
@@ -462,20 +555,34 @@ async def receive_sentry_webhook(request: Request):
         if DEBUG_MODE:
             logger.debug(f"Webhook action: {data.get('action')}")
 
-        issue_data = None
-        action = "unknown"
+        action = data.get("action", "unknown")
+        # 检查项目是否应该被忽略
+        if should_ignore_project(data):
+            project = FeishuMessage._extract_nested_value(data, 'project')
+            project_info = ""
+            if isinstance(project, dict):
+                project_info = f"ID: {project.get('id')}, Name: {project.get('name', project.get('slug', 'Unknown'))}"
+            else:
+                project_info = str(project)
+            
+            logger.info(f"Ignoring project in ignore list: {project_info}")
+            return {
+                "status": "ignored", 
+                "message": f"Project {project_info} is in ignore list",
+                "action": action
+            }
 
+        issue_data = None
         if "data" in data:
             # 处理 Sentry webhook 格式 - 数据可能在 data.error 中
             if "error" in data["data"]:
                 issue_data = data["data"]["error"]  # 错误数据在 data.error 中
-                logger.info("Found error data in data.error")
+                # logger.info("Found error data in data.error")
             else:
                 issue_data = data["data"]  # 或者直接在 data 中
                 logger.info("Found data directly in data")
 
-            action = data.get("action", "unknown")
-            logger.info(f"Processing {action} action for issue")
+            # logger.info(f"Processing {action} action for issue")
 
             if action != "created":
                 logger.info(f"Ignoring non-created action: {action}")
@@ -488,6 +595,7 @@ async def receive_sentry_webhook(request: Request):
         else:
             logger.error(f"Invalid webhook data. Keys: {list(data.keys())}")
             raise HTTPException(status_code=400, detail="Invalid webhook data format")
+
 
         success = await webhook_handler.send_to_feishu(issue_data)
 
