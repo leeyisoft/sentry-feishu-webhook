@@ -17,6 +17,49 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
 # 临时开启调试模式
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 
+# 解析项目到飞书Webhook URL的映射配置
+def parse_project_webhook_mapping() -> Dict[Any, str]:
+    """解析项目到飞书Webhook URL的映射配置
+    
+    支持格式:
+    1. JSON格式: {"project_id_1": "url1", "project_name": "url2"}
+    2. 简单格式: project_id_1=url1,project_name=url2
+    """
+    mapping_config = os.getenv("PROJECT_FEISHU_WEBHOOK_MAPPING", "{}")
+    try:
+        mapping_config = mapping_config.strip()
+        if mapping_config.startswith('{') and mapping_config.endswith('}'):
+            # JSON格式
+            raw_mapping = json.loads(mapping_config)
+            # 转换键的类型，数字键转为int
+            result = {}
+            for key, value in raw_mapping.items():
+                if key.isdigit():
+                    result[int(key)] = value
+                else:
+                    result[key] = value
+            return result
+        else:
+            # 简单格式: key1=value1,key2=value2
+            result = {}
+            if mapping_config:
+                pairs = [pair.strip() for pair in mapping_config.split(',')]
+                for pair in pairs:
+                    if '=' in pair:
+                        key, value = pair.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        if key.isdigit():
+                            result[int(key)] = value
+                        else:
+                            result[key] = value
+            return result
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"Failed to parse PROJECT_FEISHU_WEBHOOK_MAPPING: {e}, using empty mapping")
+        return {}
+
+PROJECT_WEBHOOK_MAPPING = parse_project_webhook_mapping()
+
 # 解析忽略的项目ID配置
 def parse_ignore_project_ids() -> List[Any]:
     """解析忽略的项目ID配置，支持数字和字符串"""
@@ -71,6 +114,42 @@ def should_ignore_project(issue_data: Dict[str, Any]) -> bool:
                 return True
     
     return False
+
+
+def get_project_webhook_url(issue_data: Dict[str, Any]) -> str:
+    """根据项目信息获取对应的飞书Webhook URL
+    
+    优先级:
+    1. 项目特定的URL配置
+    2. 默认的FEISHU_WEBHOOK_URL
+    """
+    if not PROJECT_WEBHOOK_MAPPING:
+        return FEISHU_WEBHOOK_URL
+    
+    # 提取项目信息
+    project = FeishuMessage._extract_nested_value(issue_data, 'project')
+    
+    if project is None:
+        return FEISHU_WEBHOOK_URL
+    
+    # 如果project是字典，提取ID和名称
+    if isinstance(project, dict):
+        project_id = project.get('id')
+        project_name = project.get('name', project.get('slug', ''))
+        
+        # 优先匹配项目ID，然后匹配项目名称
+        if project_id in PROJECT_WEBHOOK_MAPPING:
+            return PROJECT_WEBHOOK_MAPPING[project_id]
+        elif project_name in PROJECT_WEBHOOK_MAPPING:
+            return PROJECT_WEBHOOK_MAPPING[project_name]
+    
+    # 如果project是数字或字符串，直接查找
+    elif isinstance(project, (int, str)):
+        if project in PROJECT_WEBHOOK_MAPPING:
+            return PROJECT_WEBHOOK_MAPPING[project]
+    
+    # 如果没有找到特定配置，返回默认URL
+    return FEISHU_WEBHOOK_URL
 
 
 if DEBUG_MODE:
@@ -467,10 +546,14 @@ class WebhookHandler:
             proxies=None
         )
 
-    async def send_to_feishu(self, issue_data: Dict[str, Any]) -> bool:
+    async def send_to_feishu(self, issue_data: Dict[str, Any], webhook_url: str = None) -> bool:
         try:
-            if not FEISHU_WEBHOOK_URL or not FEISHU_WEBHOOK_URL.startswith(('http://', 'https://')):
-                logger.error(f"Invalid FEISHU_WEBHOOK_URL: '{FEISHU_WEBHOOK_URL}'")
+            # 如果没有提供webhook_url，则根据项目获取对应的URL
+            if webhook_url is None:
+                webhook_url = get_project_webhook_url(issue_data)
+            
+            if not webhook_url or not webhook_url.startswith(('http://', 'https://')):
+                logger.error(f"Invalid webhook URL: '{webhook_url}'")
                 return False
 
             try:
@@ -482,8 +565,13 @@ class WebhookHandler:
                 logger.error(f"Issue data keys: {list(issue_data.keys())}")
                 return False
 
+            # 记录使用的Webhook URL（仅记录域名部分以保护隐私）
+            from urllib.parse import urlparse
+            parsed_url = urlparse(webhook_url)
+            logger.info(f"Sending to Feishu webhook: {parsed_url.scheme}://{parsed_url.netloc}/...")
+
             response = await self.client.post(
-                FEISHU_WEBHOOK_URL,
+                webhook_url,
                 json=message,
                 headers={"Content-Type": "application/json"}
             )
@@ -520,6 +608,13 @@ async def startup_event():
         logger.info(f"Configured to ignore projects: {IGNORE_PROJECT_IDS}")
     else:
         logger.info("No projects configured to be ignored")
+    
+    if PROJECT_WEBHOOK_MAPPING:
+        # 只记录项目标识，不记录完整的Webhook URL以保护隐私
+        project_keys = list(PROJECT_WEBHOOK_MAPPING.keys())
+        logger.info(f"Configured project-specific webhooks for projects: {project_keys}")
+    else:
+        logger.info("Using default webhook URL for all projects")
 
 
 @app.on_event("shutdown")
