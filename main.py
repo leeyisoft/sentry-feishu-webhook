@@ -153,9 +153,23 @@ def get_project_webhook_url(issue_data: Dict[str, Any]) -> str:
 
 
 if DEBUG_MODE:
-    logger.add("debug.log", rotation="10 MB", level="DEBUG")
+    logger.add(
+        "debug.log",
+        rotation="10 MB",
+        retention="7 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}",
+        encoding="utf-8"
+    )
 else:
-    logger.add("app.log", rotation="10 MB", level="INFO")
+    logger.add(
+        "app.log",
+        rotation="10 MB",
+        retention="7 days",
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}",
+        encoding="utf-8"
+    )
 
 
 class FeishuMessage:

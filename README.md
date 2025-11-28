@@ -1,6 +1,10 @@
 # Sentry to Feishu Webhook 中台服务
+**sentry-feishu-webhook** 是一个专为开发团队打造的轻量级集成服务 ，专注于将 Sentry 错误监控系统的 Webhook 事件 实时、精准地推送到飞书。让团队第一时间感知生产环境异常，快速响应，守护代码质量；
 
-一个用于接收自建部署 Sentry 的 issue webhook 并发送通知到飞书群的中台服务。
+该项目已开源至  [Gitee](https://gitee.com/leeyi/sentry-feishu-webhook) 和 [Github](https://github.com/leeyisoft/sentry-feishu-webhook)，支持多项目、多群组的灵活配置；
+
+基于 MIT 开源协议 ，欢迎 Star ⭐、Fork 🍴 和贡献代码 💻。
+
 
 ## 功能特性
 
@@ -15,15 +19,31 @@
 
 ## 快速开始
 
-### 1. 配置飞书机器人
+### 1. 获取 Webhook URL
 
-1. 在飞书群中添加自定义机器人
-2. 获取 Webhook URL
-3. （可选）配置签名验证并获取签名密钥
+#### 方式一：飞书群机器人（推荐）
+
+1. 创建一个飞书群
+2. 在群聊右上角点击设置按钮
+3. 选择「群机器人」-> 「添加机器人」-> 「自定义机器人」
+4. 填写机器人名称和描述
+5. 复制生成的 Webhook URL
+6. （可选）开启签名验证并记录签名密钥
+
+#### 方式二：飞书开放平台
+
+1. 登录 [飞书开放平台](https://open.feishu.cn/)
+2. 创建企业自建应用
+3. 在「机器人」功能中获取 Webhook URL
+4. 配置相应的权限和回调地址
+
+#### 配置到项目中
+
+将获取到的 Webhook URL 配置到项目的 `PROJECT_FEISHU_WEBHOOK_MAPPING` 环境变量中
 
 ### 2. 配置 Sentry Webhook
 
-在 Sentry 项目中配置 Webhook：
+在 Sentry 管理后台中 项目中配置 Webhook：
 
 1. 进入项目设置 -> Integrations -> Webhooks
 2. 添加 Webhook URL: `http://your-server:8000/webhook/sentry`
@@ -136,11 +156,63 @@ sudo systemctl status sentry-feishu
 
 ## 环境变量配置
 
+### 基础配置
+
 | 变量名 | 描述 | 必填 | 示例 |
 |--------|------|------|------|
-| FEISHU_WEBHOOK_URL | 飞书机器人 Webhook URL | ✅ | https://open.feishu.cn/open-apis/bot/v2/hook/xxx |
+| FEISHU_WEBHOOK_URL | 默认飞书机器人 Webhook URL | ❌ | https://open.feishu.cn/open-apis/bot/v2/hook/xxx |
+| FEISHU_SECRET | 飞书机器人签名密钥 | ❌ | your_secret_key |
+| SENTRY_CLIENT_SECRET | Sentry Webhook 验证密钥 | ❌ | your_sentry_secret |
 | PORT | 服务监听端口 | ❌ | 8000 |
 | DEBUG_MODE | 调试模式 | ❌ | false |
+
+### 高级配置
+
+#### PROJECT_FEISHU_WEBHOOK_MAPPING
+
+**用途**: 配置不同 Sentry 项目到不同飞书群的映射关系
+
+**支持格式**:
+
+1. **JSON 格式**（推荐）:
+```bash
+# 压缩格式
+PROJECT_FEISHU_WEBHOOK_MAPPING='{"1": "https://open.feishu.cn/hook/url1", "项目A": "https://open.feishu.cn/hook/url2"}'
+
+# 格式化格式（支持多行）
+PROJECT_FEISHU_WEBHOOK_MAPPING='{
+  "1": "https://open.feishu.cn/hook/url1",
+  "项目A": "https://open.feishu.cn/hook/url2",
+  "2": "https://open.feishu.cn/hook/url3"
+}'
+```
+
+2. **简单格式**:
+```bash
+PROJECT_FEISHU_WEBHOOK_MAPPING=1=https://open.feishu.cn/hook/url1,项目A=https://open.feishu.cn/hook/url2
+```
+
+**说明**:
+- 键可以是项目 ID（数字）或项目名称（字符串）
+- 项目 ID 会自动转换为整数进行匹配
+- 如果找不到匹配的项目，会使用 `FEISHU_WEBHOOK_URL` 作为默认值
+- 如果两者都未配置，该项目的通知将被忽略
+
+#### IGNORE_TO_FEECHU_PROJECT_IDS
+
+**用途**: 配置需要忽略的项目，这些项目的 Sentry 事件不会发送飞书通知
+
+**格式**: JSON 数组，支持项目 ID（数字）和项目名称（字符串）
+
+```bash
+# 忽略项目 ID 为 3 和名称为 "项目名称" 的项目
+IGNORE_TO_FEECHU_PROJECT_IDS=[3, "项目名称", "test-project"]
+```
+
+**使用场景**:
+- 测试项目不需要告警
+- 某些低优先级项目
+- 临时屏蔽某个项目的通知
 
 ## API 端点
 
