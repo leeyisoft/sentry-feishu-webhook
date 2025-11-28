@@ -21,7 +21,7 @@
 
 ### 1. 获取 Webhook URL
 
-#### 方式一：飞书群机器人（推荐）
+#### 方式一：飞书群机器人
 
 1. 创建一个飞书群
 2. 在群聊右上角点击设置按钮
@@ -53,40 +53,7 @@ http://172.26.86.198:8000/webhook/sentry
 
 ### 3. 部署服务
 
-#### 方式一：使用 Docker Compose（推荐）
-
-```bash
-# 1. 克隆或创建项目目录
-cd notify
-
-# 2. 复制环境变量配置文件
-cp .env.example .env
-
-# 3. 编辑 .env 文件，填入实际的配置
-vim .env
-
-# 4. 启动服务
-docker-compose up -d
-
-# 5. 查看日志
-docker-compose logs -f
-```
-
-#### 方式二：直接运行
-
-```bash
-# 1. 安装依赖
-pip install -r requirements.txt
-
-# 2. 配置环境变量
-cp .env.example .env
-vim .env
-
-# 3. 运行服务
-python main.py
-```
-
-#### 方式三：使用 systemd（生产环境）
+#### 方式1：使用 systemd（生产环境）
 
 创建 systemd 服务文件 `/etc/systemd/system/sentry-feishu.service`:
 
@@ -152,6 +119,43 @@ sudo systemctl daemon-reload
 sudo systemctl enable sentry-feishu
 sudo systemctl start sentry-feishu
 sudo systemctl status sentry-feishu
+```
+
+
+#### 方式2：使用 Docker Compose
+
+```bash
+# 1. 克隆或创建项目目录
+cd notify
+
+# 2. 复制环境变量配置文件
+cp .env.example .env
+
+# 3. 编辑 .env 文件，填入实际的配置
+vim .env
+
+# 4. 启动服务
+docker compose up -d
+
+# 针对 sentry-feishu-webhook 服务 加载新 env
+docker compose up -d --force-recreate --wait sentry-feishu-webhook
+
+# 5. 查看日志
+docker compose logs -f
+```
+
+#### 方式3：直接运行
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 配置环境变量
+cp .env.example .env
+vim .env
+
+# 3. 运行服务
+python main.py
 ```
 
 ## 环境变量配置
